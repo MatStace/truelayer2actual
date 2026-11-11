@@ -29,7 +29,7 @@ import {
   getActualImportedIds,
   setActualImportedId,
 } from '../clients/actual.js';
-import { mapTransaction, planImportedIdMigrations } from '../mapper.js';
+import { importedIdFor, mapTransaction, planImportedIdMigrations } from '../mapper.js';
 import { notifyConnection } from '../notify.js';
 import { createMutex } from '../util/lock.js';
 import { describeError } from '../util/errors.js';
@@ -332,6 +332,59 @@ export function fetchKey(a: { connectionId: string; truelayerAccountId: string }
   return `${a.connectionId}:${a.truelayerAccountId}`;
 }
 
+/**
+ * Actual creates the other side itself when an imported transaction matches a
+ * transfer payee. If TrueLayer also returns that same transfer from both
+ * mapped accounts, only import the first copy and let Actual create the pair.
+ */
+export function planInternalTransferSkips(
+  accounts: Account[],
+  fetched: Map<string, FetchResult>
+): Map<string, Set<string>> {
+  const skipped = new Map<string, Set<string>>();
+  const seen = new Set<string>();
+
+  for (let i = 0; i < accounts.length; i++) {
+    const source = accounts[i];
+    if (source.accountKind !== 'account') continue;
+    const sourceResult = fetched.get(fetchKey(source));
+    if (!sourceResult || 'error' in sourceResult) continue;
+
+    for (let j = i + 1; j < accounts.length; j++) {
+      const counterpart = accounts[j];
+      if (
+        counterpart.accountKind !== 'account' ||
+        counterpart.budgetId !== source.budgetId ||
+        counterpart.connectionId !== source.connectionId ||
+        counterpart.actualAccountId === source.actualAccountId
+      ) continue;
+      const counterpartResult = fetched.get(fetchKey(counterpart));
+      if (!counterpartResult || 'error' in counterpartResult) continue;
+
+      for (const txn of sourceResult.txns) {
+        const id = importedIdFor(txn);
+        const pairKey = `${source.budgetId}:${id}`;
+        if (seen.has(pairKey)) continue;
+        const matchIndex = counterpartResult.txns.findIndex((other) =>
+          importedIdFor(other) === id &&
+          other.amount === -txn.amount &&
+          other.timestamp.slice(0, 10) === txn.timestamp.slice(0, 10) &&
+          other.description.trim().toLowerCase() === txn.description.trim().toLowerCase()
+        );
+        if (matchIndex === -1) continue;
+
+        // Keep the first mapped account's entry. Actual creates the counterpart
+        // when it recognizes the transfer payee on import.
+        const ids = skipped.get(fetchKey(counterpart)) ?? new Set<string>();
+        ids.add(importedIdFor(counterpartResult.txns[matchIndex]));
+        skipped.set(fetchKey(counterpart), ids);
+        seen.add(pairKey);
+      }
+    }
+  }
+  return skipped;
+}
+
 export interface FetchPlanItem {
   connectionId: string;
   truelayerAccountId: string;
@@ -416,14 +469,20 @@ async function syncAccount(
   label: string,
   fetched: FetchResult | undefined,
   lastSyncedAt: Map<string, string>,
-  summary: SyncSummary
+  summary: SyncSummary,
+  internalTransferSkips: Set<string> = new Set()
 ): Promise<void> {
   try {
     if (!fetched) throw new Error('No TrueLayer data was fetched for this account');
     if ('error' in fetched) throw new Error(fetched.error);
 
     const { from, to } = resolveSyncWindow(account.lastSyncedAt, syncLookbackDays());
-    const { txns, balance } = fetched;
+    const { balance } = fetched;
+    const txns = fetched.txns.filter((txn) => !internalTransferSkips.has(importedIdFor(txn)));
+    const suppressedCount = fetched.txns.length - txns.length;
+    if (suppressedCount > 0) {
+      logger.info(`[${label}] Suppressed ${suppressedCount} mirrored internal transfer(s)`);
+    }
 
     logger.info(`[${label}] Syncing ${txns.length} transaction(s) (window from ${from})...`);
 
@@ -548,13 +607,15 @@ async function runSyncInternal(): Promise<SyncSummary> {
         // The budget is reused across runs; pull remote changes once before
         // migrating IDs and importing so stale local data is never written back.
         await syncActualBudget();
+        const transferSkips = planInternalTransferSkips(ready, fetched);
         for (const account of ready) {
           await syncAccount(
             account,
             `${account.name} → ${budget.name}`,
             fetched.get(fetchKey(account)),
             lastSyncedAt,
-            summary
+            summary,
+            transferSkips.get(fetchKey(account))
           );
         }
       });
